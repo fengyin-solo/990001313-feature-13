@@ -73,6 +73,19 @@ try {
         FOREIGN KEY (`processed_by`) REFERENCES `admins`(`id`) ON DELETE SET NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='举报表'");
 
+    // 后台常用筛选条件表
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `saved_filters` (
+        `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        `name` VARCHAR(50) NOT NULL COMMENT '条件名称',
+        `params` TEXT NOT NULL COMMENT '筛选参数JSON: status,type,keyword,page',
+        `created_by` INT UNSIGNED DEFAULT NULL COMMENT '创建人管理员ID',
+        `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        UNIQUE KEY `uk_name` (`name`),
+        INDEX `idx_created_by` (`created_by`),
+        FOREIGN KEY (`created_by`) REFERENCES `admins`(`id`) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台常用筛选条件'");
+
     // 插入默认管理员 admin/admin123
     $hash = password_hash('admin123', PASSWORD_DEFAULT);
     $stmt = $pdo->prepare("INSERT IGNORE INTO `admins` (`username`, `password`) VALUES ('admin', ?)");

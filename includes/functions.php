@@ -234,3 +234,122 @@ function getPendingReportCount() {
     $db = getDB();
     return $db->query("SELECT COUNT(*) FROM reports WHERE status = 0")->fetchColumn();
 }
+
+/* ===================== 后台列表常用条件 ===================== */
+
+/**
+ * 常用筛选条件表（幂等建表，兼容已安装的环境）
+ */
+function ensureSavedFiltersTable() {
+    static $checked = false;
+    if ($checked) return;
+    $checked = true;
+    $db = getDB();
+    $db->exec("CREATE TABLE IF NOT EXISTS `saved_filters` (
+        `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        `name` VARCHAR(50) NOT NULL COMMENT '条件名称',
+        `params` TEXT NOT NULL COMMENT '筛选参数JSON: status,type,keyword,page',
+        `created_by` INT UNSIGNED DEFAULT NULL COMMENT '创建人管理员ID',
+        `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        UNIQUE KEY `uk_name` (`name`),
+        INDEX `idx_created_by` (`created_by`),
+        FOREIGN KEY (`created_by`) REFERENCES `admins`(`id`) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台常用筛选条件'");
+}
+
+/**
+ * 规范化留言列表筛选参数（白名单，列表页/下载/保存共用同一口径）
+ */
+function normalizeMessageFilters(array $src) {
+    $status = isset($src['status']) && in_array((string)$src['status'], ['0', '1', '2'], true)
+        ? (string)$src['status'] : '';
+    $type = isset($src['type']) && in_array((string)$src['type'], ['help', 'suggest', 'lost'], true)
+        ? (string)$src['type'] : '';
+    $keyword = isset($src['keyword']) ? trim((string)$src['keyword']) : '';
+    $keyword = mb_substr($keyword, 0, 100);
+    $page = isset($src['page']) ? intval($src['page']) : 1;
+    if ($page < 1) $page = 1;
+    if ($page > 10000) $page = 10000;
+    return ['status' => $status, 'type' => $type, 'keyword' => $keyword, 'page' => $page];
+}
+
+/**
+ * 根据筛选参数构造留言列表 WHERE（与屏幕列表完全一致的口径）
+ * 返回 [whereSql, params]
+ */
+function buildMessageWhere(array $filters) {
+    $where = "WHERE 1=1";
+    $params = [];
+    if ($filters['status'] !== '') {
+        $where .= " AND status = ?";
+        $params[] = intval($filters['status']);
+    }
+    if ($filters['type'] !== '') {
+        $where .= " AND type = ?";
+        $params[] = $filters['type'];
+    }
+    if ($filters['keyword'] !== '') {
+        $where .= " AND (title LIKE ? OR content LIKE ? OR nickname LIKE ?)";
+        $kw = '%' . $filters['keyword'] . '%';
+        $params[] = $kw;
+        $params[] = $kw;
+        $params[] = $kw;
+    }
+    return [$where, $params];
+}
+
+/**
+ * 留言列表分页链接
+ */
+function messageListUrl(array $filters, $page = null) {
+    $query = [];
+    if ($filters['status'] !== '') $query['status'] = $filters['status'];
+    if ($filters['type'] !== '') $query['type'] = $filters['type'];
+    if ($filters['keyword'] !== '') $query['keyword'] = $filters['keyword'];
+    if ($page !== null && $page > 1) $query['page'] = $page;
+    return 'index.php' . ($query ? '?' . http_build_query($query) : '');
+}
+
+/**
+ * 筛选条件的人类可读描述（用于提示与文件说明）
+ */
+function describeMessageFilters(array $filters) {
+    $statusMap = ['' => '全部', '0' => '待审核', '1' => '已通过', '2' => '已拒绝'];
+    $typeMap = ['' => '全部', 'help' => '居民求助', 'suggest' => '意见建议', 'lost' => '失物招领'];
+    return '状态：' . $statusMap[$filters['status']]
+        . '；类型：' . $typeMap[$filters['type']]
+        . '；关键词：' . ($filters['keyword'] !== '' ? $filters['keyword'] : '无')
+        . '；第 ' . $filters['page'] . ' 页';
+}
+
+/**
+ * 获取全部常用条件
+ */
+function getSavedFilters() {
+    ensureSavedFiltersTable();
+    $db = getDB();
+    return $db->query("SELECT sf.*, a.username AS admin_name
+        FROM saved_filters sf
+        LEFT JOIN admins a ON sf.created_by = a.id
+        ORDER BY sf.updated_at DESC")->fetchAll();
+}
+
+/**
+ * 按ID获取常用条件
+ */
+function getSavedFilter($id) {
+    ensureSavedFiltersTable();
+    $db = getDB();
+    $stmt = $db->prepare("SELECT * FROM saved_filters WHERE id = ?");
+    $stmt->execute([intval($id)]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+/**
+ * 判断 PDO 异常是否为唯一键冲突
+ */
+function isDuplicateKeyError(PDOException $e) {
+    return $e->getCode() === '23000';
+}

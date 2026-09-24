@@ -9,38 +9,73 @@ $cssPath = '../assets/css/style.css';
 $jsPath = '../assets/js/main.js';
 
 $db = getDB();
+ensureSavedFiltersTable();
 
-// 筛选参数
-$status = $_GET['status'] ?? '';
-$type = $_GET['type'] ?? '';
-$keyword = trim($_GET['keyword'] ?? '');
-$page = max(1, intval($_GET['page'] ?? 1));
+// 三类入口：
+// 1) reset=1 手动重置，回到无条件列表并清空记忆
+// 2) saved=ID 应用某个常用条件（含保存时的页码，即“原记录位置”）
+// 3) 无任何定位参数重新进入后台：回到上次离开时的条件与页码
+$reset = isset($_GET['reset']) && $_GET['reset'] == 1;
+$savedId = intval($_GET['saved'] ?? 0);
+
+if ($reset) {
+    setcookie('admin_last_filters', '', time() - 3600, '/');
+    header('Location: index.php');
+    exit;
+}
+
+if ($savedId > 0) {
+    $saved = getSavedFilter($savedId);
+    if (!$saved) {
+        $notice = '常用条件不存在或已被删除';
+        $filters = normalizeMessageFilters($_GET);
+    } else {
+        $savedParams = json_decode($saved['params'], true);
+        if (!is_array($savedParams)) $savedParams = [];
+        $filters = normalizeMessageFilters($savedParams);
+        $notice = '已回到常用条件「' . $saved['name'] . '」保存的位置（' . describeMessageFilters($filters) . '）';
+    }
+} else {
+    $hasListParams = isset($_GET['status']) || isset($_GET['type']) || isset($_GET['keyword']) || isset($_GET['page']);
+    if (!$hasListParams && !empty($_COOKIE['admin_last_filters'])) {
+        $lastParams = json_decode(base64_decode($_COOKIE['admin_last_filters']), true);
+        if (is_array($lastParams)) {
+            $restored = normalizeMessageFilters($lastParams);
+            $hasRestoredCriteria = $restored['status'] !== ''
+                || $restored['type'] !== ''
+                || $restored['keyword'] !== ''
+                || $restored['page'] > 1;
+            if ($hasRestoredCriteria) {
+                header('Location: ' . messageListUrl($restored, $restored['page']));
+                exit;
+            }
+        }
+    }
+    $filters = normalizeMessageFilters($_GET);
+    $notice = '';
+}
+
+// 记忆本次定位口径（含页码），下次重新进入后台时回到此处
+setcookie('admin_last_filters', base64_encode(json_encode($filters, JSON_UNESCAPED_UNICODE)), time() + 86400 * 365, '/');
+
+$status = $filters['status'];
+$type = $filters['type'];
+$keyword = $filters['keyword'];
+$page = $filters['page'];
 $pageSize = 15;
 $offset = ($page - 1) * $pageSize;
 
-$where = "WHERE 1=1";
-$params = [];
-
-if ($status !== '' && in_array($status, ['0', '1', '2'])) {
-    $where .= " AND status = ?";
-    $params[] = intval($status);
-}
-if ($type && in_array($type, ['help', 'suggest', 'lost'])) {
-    $where .= " AND type = ?";
-    $params[] = $type;
-}
-if ($keyword) {
-    $where .= " AND (title LIKE ? OR content LIKE ? OR nickname LIKE ?)";
-    $kw = "%$keyword%";
-    $params[] = $kw;
-    $params[] = $kw;
-    $params[] = $kw;
-}
+list($where, $params) = buildMessageWhere($filters);
 
 $countStmt = $db->prepare("SELECT COUNT(*) FROM messages $where");
 $countStmt->execute($params);
-$total = $countStmt->fetchColumn();
-$totalPages = ceil($total / $pageSize);
+$total = (int)$countStmt->fetchColumn();
+$totalPages = max(1, (int)ceil($total / $pageSize));
+if ($page > $totalPages) {
+    $page = $totalPages;
+    $filters['page'] = $page;
+    $offset = ($page - 1) * $pageSize;
+}
 
 $sql = "SELECT * FROM messages $where ORDER BY created_at DESC LIMIT $pageSize OFFSET $offset";
 $stmt = $db->prepare($sql);
@@ -49,6 +84,13 @@ $messages = $stmt->fetchAll();
 
 // 统计
 $pendingCount = $db->query("SELECT COUNT(*) FROM messages WHERE status = 0")->fetchColumn();
+
+// 常用条件
+$savedFilters = getSavedFilters();
+
+// 当前条件的下载/重置链接（始终携带完整定位口径，下载失败也不会丢条件）
+$downloadUrl = 'export_messages.php?' . http_build_query($filters);
+$resetUrl = 'index.php?reset=1';
 
 include __DIR__ . '/header.php';
 ?>
@@ -75,6 +117,10 @@ include __DIR__ . '/header.php';
             <span class="admin-user">👤 <?= cleanInput($_SESSION['admin_name']) ?></span>
         </div>
 
+        <?php if (!empty($notice)): ?>
+        <div class="saved-filter-notice">📌 <?= cleanInput($notice) ?></div>
+        <?php endif; ?>
+
         <!-- 筛选栏 -->
         <div class="admin-filter">
             <form method="GET" class="filter-form">
@@ -92,8 +138,44 @@ include __DIR__ . '/header.php';
                 </select>
                 <input type="text" name="keyword" placeholder="搜索关键词..." value="<?= cleanInput($keyword) ?>">
                 <button type="submit" class="btn btn-primary btn-sm">筛选</button>
-                <a href="index.php" class="btn btn-secondary btn-sm">重置</a>
+                <a href="<?= $resetUrl ?>" class="btn btn-secondary btn-sm">重置</a>
+                <button type="button" class="btn btn-success btn-sm" onclick="saveCurrentFilter()">💾 保存为常用条件</button>
+                <button type="button" class="btn btn-info btn-sm" onclick="downloadResults()">⬇ 下载结果</button>
             </form>
+        </div>
+
+        <!-- 常用条件 -->
+        <div class="saved-filter-bar">
+            <span class="saved-filter-label">⭐ 常用条件：</span>
+            <?php if (empty($savedFilters)): ?>
+            <span class="saved-filter-empty">暂无，设置好筛选后点击「保存为常用条件」</span>
+            <?php else: ?>
+            <?php foreach ($savedFilters as $sf):
+                $sfParams = json_decode($sf['params'], true);
+                if (!is_array($sfParams)) $sfParams = [];
+                $sfParams = normalizeMessageFilters($sfParams);
+                $sfNameJs = htmlspecialchars(json_encode($sf['name'], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG), ENT_QUOTES, 'UTF-8');
+            ?>
+            <span class="saved-chip" title="<?= cleanInput(describeMessageFilters($sfParams)) ?>">
+                <a href="index.php?saved=<?= $sf['id'] ?>"><?= cleanInput($sf['name']) ?></a>
+                <button type="button" class="chip-op" title="用当前条件覆盖更新" onclick="updateSavedFilter(<?= $sf['id'] ?>, <?= $sfNameJs ?>)">↻</button>
+                <button type="button" class="chip-op" title="重命名" onclick="renameSavedFilter(<?= $sf['id'] ?>, <?= $sfNameJs ?>)">✎</button>
+                <button type="button" class="chip-op" title="删除" onclick="deleteSavedFilter(<?= $sf['id'] ?>, <?= $sfNameJs ?>)">×</button>
+            </span>
+            <?php endforeach; ?>
+            <?php endif; ?>
+            <span class="saved-filter-tools">
+                <a href="api.php?action=export_filters" class="chip-link">📦 导出打包</a>
+                <button type="button" class="chip-link" onclick="document.getElementById('importFilterFile').click()">📥 导入恢复</button>
+                <input type="file" id="importFilterFile" accept=".json,application/json" style="display:none;" onchange="importFilters(this)">
+            </span>
+        </div>
+
+        <!-- 下载失败提示（保留当前条件，可重试或改用直链下载） -->
+        <div id="downloadErrorBar" class="download-error-bar" style="display:none;">
+            <span id="downloadErrorText">下载失败，当前筛选条件未改变。</span>
+            <button type="button" class="btn btn-warning btn-xs" onclick="retryDownload()">重试</button>
+            <a id="downloadDirectLink" href="<?= htmlspecialchars($downloadUrl, ENT_QUOTES) ?>" class="btn btn-secondary btn-xs">直接下载</a>
         </div>
 
         <!-- 留言表格 -->
@@ -145,13 +227,13 @@ include __DIR__ . '/header.php';
         <?php if ($totalPages > 1): ?>
         <div class="pagination">
             <?php if ($page > 1): ?>
-            <a href="index.php?page=<?= $page - 1 ?>&status=<?= $status ?>&type=<?= $type ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">上一页</a>
+            <a href="<?= messageListUrl($filters, $page - 1) ?>" class="page-btn">上一页</a>
             <?php endif; ?>
             <?php for ($i = max(1, $page - 2); $i <= min($totalPages, $page + 2); $i++): ?>
-            <a href="index.php?page=<?= $i ?>&status=<?= $status ?>&type=<?= $type ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn <?= $i === $page ? 'active' : '' ?>"><?= $i ?></a>
+            <a href="<?= messageListUrl($filters, $i) ?>" class="page-btn <?= $i === $page ? 'active' : '' ?>"><?= $i ?></a>
             <?php endfor; ?>
             <?php if ($page < $totalPages): ?>
-            <a href="index.php?page=<?= $page + 1 ?>&status=<?= $status ?>&type=<?= $type ?>&keyword=<?= urlencode($keyword) ?>" class="page-btn">下一页</a>
+            <a href="<?= messageListUrl($filters, $page + 1) ?>" class="page-btn">下一页</a>
             <?php endif; ?>
             <span class="page-info">共 <?= $total ?> 条</span>
         </div>
@@ -171,6 +253,120 @@ include __DIR__ . '/header.php';
 </div>
 
 <script>
+const currentFilters = {
+    status: <?= json_encode($status, JSON_HEX_TAG) ?>,
+    type: <?= json_encode($type, JSON_HEX_TAG) ?>,
+    keyword: <?= json_encode($keyword, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>,
+    page: <?= (int)$page ?>
+};
+
+function postApi(params) {
+    const body = new URLSearchParams(params);
+    return fetch('api.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: body.toString()
+    }).then(r => r.json());
+}
+
+function saveCurrentFilter() {
+    const name = prompt('请输入常用条件名称：');
+    if (name === null) return;
+    if (!name.trim()) { alert('名称不能为空'); return; }
+    postApi(Object.assign({action: 'save_filter', name: name.trim()}, currentFilters))
+    .then(data => {
+        alert(data.msg);
+        if (data.code === 0) location.reload();
+    })
+    .catch(() => alert('保存失败，请重试（当前条件未改变）'));
+}
+
+function updateSavedFilter(id, name) {
+    if (!confirm('确定用当前筛选条件覆盖「' + name + '」吗？')) return;
+    postApi(Object.assign({action: 'update_filter', id: id}, currentFilters))
+    .then(data => {
+        alert(data.msg);
+        if (data.code === 0) location.reload();
+    });
+}
+
+function renameSavedFilter(id, oldName) {
+    const name = prompt('请输入新的名称：', oldName);
+    if (name === null) return;
+    if (!name.trim()) { alert('名称不能为空'); return; }
+    postApi({action: 'rename_filter', id: id, name: name.trim()})
+    .then(data => {
+        alert(data.msg);
+        if (data.code === 0) location.reload();
+    });
+}
+
+function deleteSavedFilter(id, name) {
+    if (!confirm('确定删除常用条件「' + name + '」吗？')) return;
+    postApi({action: 'delete_filter', id: id})
+    .then(data => {
+        alert(data.msg);
+        if (data.code === 0) location.reload();
+    });
+}
+
+function importFilters(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    if (!confirm('导入后同名条件不会被覆盖，将自动改名，确定继续？')) {
+        input.value = '';
+        return;
+    }
+    const formData = new FormData();
+    formData.append('action', 'import_filters');
+    formData.append('file', file);
+    fetch('api.php', {method: 'POST', body: formData})
+    .then(r => r.json())
+    .then(data => {
+        if (data.code === 0) {
+            alert(data.msg);
+            location.reload();
+        } else {
+            alert(data.msg);
+        }
+    })
+    .catch(() => alert('导入失败，请重试'))
+    .finally(() => { input.value = ''; });
+}
+
+// ===== 结果下载：失败时留在本页、条件不变，可重试 =====
+let downloadRetryUrl = <?= json_encode($downloadUrl, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>;
+
+function downloadResults() {
+    document.getElementById('downloadErrorBar').style.display = 'none';
+    fetch(downloadRetryUrl, {headers: {'Accept': 'text/csv'}})
+    .then(r => {
+        if (!r.ok) throw new Error('服务器返回异常（HTTP ' + r.status + '）');
+        const type = r.headers.get('Content-Type') || '';
+        if (type.indexOf('text/csv') === -1) throw new Error('返回内容不是结果文件');
+        const cd = r.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i);
+        return r.blob().then(blob => {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = m ? decodeURIComponent(m[1]) : '留言结果.csv';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+        });
+    })
+    .catch(err => {
+        document.getElementById('downloadErrorText').textContent = '下载失败：' + err.message + '，当前筛选条件未改变，可重试。';
+        document.getElementById('downloadErrorBar').style.display = 'flex';
+    });
+}
+
+function retryDownload() {
+    downloadResults();
+}
+
 function auditMessage(id, status) {
     const action = status === 1 ? '通过' : '拒绝';
     if (!confirm('确定要' + action + '这条留言吗？')) return;
