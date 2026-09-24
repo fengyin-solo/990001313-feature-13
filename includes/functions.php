@@ -234,3 +234,265 @@ function getPendingReportCount() {
     $db = getDB();
     return $db->query("SELECT COUNT(*) FROM reports WHERE status = 0")->fetchColumn();
 }
+
+/* ===================== 常用条件保存 / 定位记忆 / 结果下载 ===================== */
+
+/**
+ * 确保常用条件相关表存在（幂等，与 database/migration_add_saved_filters.sql 保持一致）
+ */
+function ensureFilterTables($db) {
+    static $checked = false;
+    if ($checked) return;
+    $db->exec("CREATE TABLE IF NOT EXISTS `saved_filters` (
+        `id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        `admin_id` INT UNSIGNED NOT NULL COMMENT '所属管理员ID',
+        `name` VARCHAR(50) NOT NULL COMMENT '条件名称',
+        `status` VARCHAR(2) NOT NULL DEFAULT '' COMMENT '状态筛选: 空=全部, 0待审核, 1已通过, 2已拒绝',
+        `type` VARCHAR(10) NOT NULL DEFAULT '' COMMENT '类型筛选: 空=全部, help求助, suggest建议, lost失物招领',
+        `keyword` VARCHAR(100) NOT NULL DEFAULT '' COMMENT '搜索关键词',
+        `page` INT UNSIGNED NOT NULL DEFAULT 1 COMMENT '保存时所在页码（定位口径）',
+        `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        UNIQUE KEY `uk_admin_name` (`admin_id`, `name`),
+        INDEX `idx_admin_id` (`admin_id`),
+        FOREIGN KEY (`admin_id`) REFERENCES `admins`(`id`) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台常用筛选条件'");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS `admin_view_states` (
+        `admin_id` INT UNSIGNED NOT NULL COMMENT '管理员ID',
+        `page_key` VARCHAR(50) NOT NULL DEFAULT 'messages' COMMENT '页面标识: messages留言列表',
+        `params` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '最后访问的查询参数(query string)',
+        `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        PRIMARY KEY (`admin_id`, `page_key`),
+        FOREIGN KEY (`admin_id`) REFERENCES `admins`(`id`) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台列表定位记忆'");
+
+    $checked = true;
+}
+
+/**
+ * 归一化留言列表筛选口径（屏幕列表与下载共用，保证结果一致）
+ */
+function normalizeMessageFilters($input) {
+    $status = isset($input['status']) && in_array((string)$input['status'], ['0', '1', '2'], true)
+        ? (string)$input['status'] : '';
+    $type = isset($input['type']) && in_array((string)$input['type'], ['help', 'suggest', 'lost'], true)
+        ? (string)$input['type'] : '';
+    $keyword = isset($input['keyword']) ? mb_substr(trim((string)$input['keyword']), 0, 100) : '';
+    $page = max(1, intval($input['page'] ?? 1));
+    return ['status' => $status, 'type' => $type, 'keyword' => $keyword, 'page' => $page];
+}
+
+/**
+ * 依据筛选口径构造 WHERE 与参数（屏幕列表与下载共用）
+ */
+function buildMessageWhere($filters) {
+    $where = "WHERE 1=1";
+    $params = [];
+
+    if ($filters['status'] !== '') {
+        $where .= " AND status = ?";
+        $params[] = intval($filters['status']);
+    }
+    if ($filters['type'] !== '') {
+        $where .= " AND type = ?";
+        $params[] = $filters['type'];
+    }
+    if ($filters['keyword'] !== '') {
+        $where .= " AND (title LIKE ? OR content LIKE ? OR nickname LIKE ?)";
+        $kw = "%{$filters['keyword']}%";
+        $params[] = $kw;
+        $params[] = $kw;
+        $params[] = $kw;
+    }
+    return [$where, $params];
+}
+
+/**
+ * 读取管理员上次留言列表的定位参数（含页码）
+ */
+function getAdminViewState($db, $adminId, $pageKey = 'messages') {
+    ensureFilterTables($db);
+    $stmt = $db->prepare("SELECT params FROM admin_view_states WHERE admin_id = ? AND page_key = ?");
+    $stmt->execute([$adminId, $pageKey]);
+    $params = $stmt->fetchColumn();
+    if ($params === false || $params === '') return [];
+    parse_str($params, $parsed);
+    return is_array($parsed) ? $parsed : [];
+}
+
+/**
+ * 记录管理员当前留言列表定位口径（含页码）
+ */
+function saveAdminViewState($db, $adminId, $filters, $pageKey = 'messages') {
+    ensureFilterTables($db);
+    $query = http_build_query([
+        'status' => $filters['status'],
+        'type' => $filters['type'],
+        'keyword' => $filters['keyword'],
+        'page' => $filters['page'],
+    ]);
+    $stmt = $db->prepare(
+        "INSERT INTO admin_view_states (admin_id, page_key, params) VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE params = VALUES(params)"
+    );
+    $stmt->execute([$adminId, $pageKey, $query]);
+}
+
+/**
+ * 列出管理员保存的常用条件
+ */
+function getSavedFilters($db, $adminId) {
+    ensureFilterTables($db);
+    $stmt = $db->prepare("SELECT * FROM saved_filters WHERE admin_id = ? ORDER BY id DESC");
+    $stmt->execute([$adminId]);
+    return $stmt->fetchAll();
+}
+
+/**
+ * 保存（新增）常用条件。
+ * 仅做 INSERT：同一管理员同名时由唯一键拒绝，返回 null；
+ * 多人/并发保存同名条件时互不覆盖，调用方提示改名即可。
+ */
+function createSavedFilter($db, $adminId, $name, $filters) {
+    ensureFilterTables($db);
+    $name = mb_substr(trim($name), 0, 50);
+    if ($name === '') {
+        throw new Exception('请输入条件名称');
+    }
+    try {
+        $stmt = $db->prepare(
+            "INSERT INTO saved_filters (admin_id, name, status, type, keyword, page) VALUES (?, ?, ?, ?, ?, ?)"
+        );
+        $stmt->execute([
+            $adminId, $name,
+            $filters['status'], $filters['type'], $filters['keyword'], $filters['page'],
+        ]);
+        return $db->lastInsertId();
+    } catch (PDOException $e) {
+        if (($e->errorInfo[1] ?? null) == 1062) return null; // 重名，不覆盖
+        throw $e;
+    }
+}
+
+/**
+ * 删除常用条件（只能删自己的）
+ */
+function deleteSavedFilter($db, $adminId, $id) {
+    ensureFilterTables($db);
+    $stmt = $db->prepare("DELETE FROM saved_filters WHERE id = ? AND admin_id = ?");
+    $stmt->execute([$id, $adminId]);
+    return $stmt->rowCount() > 0;
+}
+
+/**
+ * 条件口径文字摘要（用于界面展示与导出文件说明）
+ */
+function describeMessageFilters($filters) {
+    $parts = [];
+    $parts[] = '状态：' . ($filters['status'] === '' ? '全部' : getStatusLabel(intval($filters['status'])));
+    $parts[] = '类型：' . ($filters['type'] === '' ? '全部' : getTypeLabel($filters['type']));
+    $parts[] = '关键词：' . ($filters['keyword'] === '' ? '无' : $filters['keyword']);
+    return implode('；', $parts);
+}
+
+/**
+ * 导出管理员常用条件为可移植的数据包（JSON 字符串）
+ */
+function exportSavedFiltersPayload($db, $adminId, $ids = null) {
+    $rows = getSavedFilters($db, $adminId);
+    if ($ids !== null) {
+        $idMap = array_flip(array_map('intval', $ids));
+        $rows = array_filter($rows, function ($r) use ($idMap) {
+            return isset($idMap[intval($r['id'])]);
+        });
+    }
+    $items = array_map(function ($r) {
+        return [
+            'name' => $r['name'],
+            'status' => $r['status'],
+            'type' => $r['type'],
+            'keyword' => $r['keyword'],
+            'page' => intval($r['page']),
+        ];
+    }, array_values($rows));
+
+    return [
+        'app' => 'community_board',
+        'kind' => 'saved_filters',
+        'version' => 1,
+        'exported_at' => date('c'),
+        'filters' => $items,
+    ];
+}
+
+/**
+ * 校验导入数据包中的单条条件，返回归一化后的结构；不合法返回 null
+ */
+function normalizeImportedFilter($item) {
+    if (!is_array($item)) return null;
+    $name = isset($item['name']) ? mb_substr(trim((string)$item['name']), 0, 50) : '';
+    if ($name === '') return null;
+    $status = isset($item['status']) && in_array((string)$item['status'], ['', '0', '1', '2'], true)
+        ? (string)$item['status'] : '';
+    $type = isset($item['type']) && in_array((string)$item['type'], ['', 'help', 'suggest', 'lost'], true)
+        ? (string)$item['type'] : '';
+    $keyword = isset($item['keyword']) ? mb_substr(trim((string)$item['keyword']), 0, 100) : '';
+    $page = max(1, min(10000, intval($item['page'] ?? 1)));
+    return compact('name', 'status', 'type', 'keyword', 'page');
+}
+
+/**
+ * 导入条件数据包。重名不覆盖，自动追加“(2)/(3)…”后缀；确实冲突到无法落库则跳过。
+ * 返回 [导入数, 改名数, 跳过数]
+ */
+function importSavedFiltersPayload($db, $adminId, $payload) {
+    ensureFilterTables($db);
+    if (!is_array($payload) || ($payload['kind'] ?? '') !== 'saved_filters' || !is_array($payload['filters'] ?? null)) {
+        throw new Exception('文件格式不正确，不是有效的条件包');
+    }
+
+    // 当前已占用的名称，导入过程中同步维护
+    $stmt = $db->prepare("SELECT name FROM saved_filters WHERE admin_id = ?");
+    $stmt->execute([$adminId]);
+    $usedNames = array_flip(array_map(function ($n) { return mb_strtolower($n); }, $stmt->fetchAll(PDO::FETCH_COLUMN)));
+
+    $insert = $db->prepare(
+        "INSERT INTO saved_filters (admin_id, name, status, type, keyword, page) VALUES (?, ?, ?, ?, ?, ?)"
+    );
+
+    $imported = $renamed = $skipped = 0;
+    foreach ($payload['filters'] as $item) {
+        $f = normalizeImportedFilter($item);
+        if ($f === null) { $skipped++; continue; }
+
+        // 为重名预留后缀空间，如“原名称(2)”，保证总长不超过 50
+        $suffix = 2;
+        $suffixStr = '(' . $suffix . ')';
+        $base = mb_strlen($f['name']) > 50 - strlen($suffixStr)
+            ? mb_substr($f['name'], 0, 50 - strlen($suffixStr))
+            : $f['name'];
+        $finalName = $base;
+        $isRenamed = false;
+        while (isset($usedNames[mb_strtolower($finalName)])) {
+            $suffixStr = '(' . $suffix . ')';
+            $base = mb_strlen($f['name']) > 50 - strlen($suffixStr)
+                ? mb_substr($f['name'], 0, 50 - strlen($suffixStr))
+                : $f['name'];
+            $finalName = $base . $suffixStr;
+            $suffix++;
+            $isRenamed = true;
+        }
+
+        try {
+            $insert->execute([$adminId, $finalName, $f['status'], $f['type'], $f['keyword'], $f['page']]);
+            $usedNames[mb_strtolower($finalName)] = true;
+            $imported++;
+            if ($isRenamed) $renamed++;
+        } catch (PDOException $e) {
+            if (($e->errorInfo[1] ?? null) == 1062) { $skipped++; continue; }
+            throw $e;
+        }
+    }
+    return [$imported, $renamed, $skipped];
+}

@@ -106,6 +106,56 @@ switch ($action) {
         }
         break;
 
+    case 'save_filter':
+        $filters = normalizeMessageFilters($_POST);
+        $name = trim($_POST['name'] ?? '');
+        $id = createSavedFilter($db, $_SESSION['admin_id'], $name, $filters);
+        if ($id === null) jsonResponse(1, '已存在同名条件，为避免覆盖请换一个名称');
+        jsonResponse(0, '保存成功', ['id' => $id]);
+        break;
+
+    case 'list_filters':
+        jsonResponse(0, 'ok', getSavedFilters($db, $_SESSION['admin_id']));
+        break;
+
+    case 'delete_filter':
+        $id = intval($_POST['id'] ?? 0);
+        if (!deleteSavedFilter($db, $_SESSION['admin_id'], $id)) jsonResponse(1, '条件不存在或已删除');
+        jsonResponse(0, '删除成功');
+        break;
+
+    case 'export_filters':
+        $ids = isset($_GET['ids']) && $_GET['ids'] !== ''
+            ? array_filter(array_map('intval', explode(',', $_GET['ids'])))
+            : null;
+        $payload = exportSavedFiltersPayload($db, $_SESSION['admin_id'], $ids);
+        if (empty($payload['filters'])) jsonResponse(1, '没有可导出的条件');
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+        $exportName = 'saved-filters_' . date('Ymd_His') . '.json';
+        header('Content-Type: application/json; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $exportName . '"; filename*=UTF-8\'\'' . rawurlencode($exportName));
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        echo $json;
+        exit;
+
+    case 'import_filters':
+        if (empty($_FILES['file']) || ($_FILES['file']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+            jsonResponse(1, '请选择要导入的条件包文件');
+        }
+        $raw = file_get_contents($_FILES['file']['tmp_name']);
+        $payload = json_decode($raw, true);
+        if (!is_array($payload)) jsonResponse(1, '文件无法解析，请选择导出的 .json 条件包');
+        try {
+            list($imported, $renamed, $skipped) = importSavedFiltersPayload($db, $_SESSION['admin_id'], $payload);
+        } catch (Exception $e) {
+            jsonResponse(1, $e->getMessage());
+        }
+        $msg = "导入完成：成功 {$imported} 条";
+        if ($renamed > 0) $msg .= "，其中 {$renamed} 条因同名已自动改名（未覆盖原有条件）";
+        if ($skipped > 0) $msg .= "，跳过 {$skipped} 条无效或冲突数据";
+        jsonResponse(0, $msg, ['imported' => $imported, 'renamed' => $renamed, 'skipped' => $skipped]);
+        break;
+
     default:
         jsonResponse(1, '未知操作');
 }
